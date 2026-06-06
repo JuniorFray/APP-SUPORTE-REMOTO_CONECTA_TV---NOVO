@@ -1,0 +1,13 @@
+{
+  "name": "controller-test",
+  "version": "1.0.0",
+  "description": "Temporary controller peer for signaling tests",
+  "main": "controller.js",
+  "scripts": {
+    "start": "node controller.js"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}

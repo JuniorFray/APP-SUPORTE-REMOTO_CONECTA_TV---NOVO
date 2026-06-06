@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">TV Remote Host</string>
+    <string name="accessibility_service_description">Permite controle remoto com clique, gesto e movimento.</string>
+</resources>
