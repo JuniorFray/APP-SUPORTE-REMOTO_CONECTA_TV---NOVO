@@ -106,6 +106,12 @@ class RemoteConnectionService : Service() {
                 try {
                     val json = JSONObject(text)
                     val type = json.optString("type")
+
+                    if (type == "remote-command") {
+                        handleRemoteCommand(webSocket, json)
+                        return
+                    }
+
                     if (type == "ack" && pendingPair) {
                         Log.d(TAG, "ack recebido com pendingPair=true; enviando pair")
                         pendingPair = false
@@ -131,6 +137,108 @@ class RemoteConnectionService : Service() {
                 service.webSocket = null
             }
         })
+    }
+
+    private fun handleRemoteCommand(socket: WebSocket, json: JSONObject) {
+        val commandId = json.optString("commandId", "")
+        val command = json.optString("command")
+        val accessibility = RemoteAccessibilityService.instance
+
+        if (accessibility == null) {
+            Log.e(TAG, "AccessibilityService indisponível para command=$command")
+            sendCommandAck(socket, commandId, command, "error", "accessibility_unavailable")
+            return
+        }
+
+        when (command) {
+            "home" -> {
+                val result = accessibility.performGlobalHome()
+                Log.d(TAG, "command=home result=$result")
+                sendCommandAck(socket, commandId, command, if (result) "ok" else "error")
+            }
+
+            "back" -> {
+                val result = accessibility.performGlobalBack()
+                Log.d(TAG, "command=back result=$result")
+                sendCommandAck(socket, commandId, command, if (result) "ok" else "error")
+            }
+
+            "recents" -> {
+                val result = accessibility.performGlobalRecents()
+                Log.d(TAG, "command=recents result=$result")
+                sendCommandAck(socket, commandId, command, if (result) "ok" else "error")
+            }
+
+            "tap" -> {
+                val x = json.optDouble("x", -1.0).toFloat()
+                val y = json.optDouble("y", -1.0).toFloat()
+                val duration = json.optLong("durationMs", 100L)
+
+                if (x >= 0f && y >= 0f) {
+                    Log.d(TAG, "command=tap x=$x y=$y duration=$duration")
+                    accessibility.performTap(x, y, duration) { success ->
+                        sendCommandAck(
+                            socket,
+                            commandId,
+                            command,
+                            if (success) "ok" else "error"
+                        )
+                    }
+                } else {
+                    Log.e(TAG, "tap inválido x=$x y=$y")
+                    sendCommandAck(socket, commandId, command, "error", "invalid_coordinates")
+                }
+            }
+
+            "swipe" -> {
+                val x1 = json.optDouble("x1", -1.0).toFloat()
+                val y1 = json.optDouble("y1", -1.0).toFloat()
+                val x2 = json.optDouble("x2", -1.0).toFloat()
+                val y2 = json.optDouble("y2", -1.0).toFloat()
+                val duration = json.optLong("durationMs", 300L)
+
+                if (x1 >= 0f && y1 >= 0f && x2 >= 0f && y2 >= 0f) {
+                    Log.d(TAG, "command=swipe x1=$x1 y1=$y1 x2=$x2 y2=$y2 duration=$duration")
+                    accessibility.performSwipe(x1, y1, x2, y2, duration) { success ->
+                        sendCommandAck(
+                            socket,
+                            commandId,
+                            command,
+                            if (success) "ok" else "error"
+                        )
+                    }
+                } else {
+                    Log.e(TAG, "swipe inválido x1=$x1 y1=$y1 x2=$x2 y2=$y2")
+                    sendCommandAck(socket, commandId, command, "error", "invalid_coordinates")
+                }
+            }
+
+            else -> {
+                Log.e(TAG, "Comando desconhecido: $command")
+                sendCommandAck(socket, commandId, command, "error", "unknown_command")
+            }
+        }
+    }
+
+    private fun sendCommandAck(
+        socket: WebSocket,
+        commandId: String,
+        command: String,
+        status: String,
+        error: String? = null
+    ) {
+        val json = JSONObject()
+            .put("type", "remote-command-ack")
+            .put("commandId", commandId)
+            .put("command", command)
+            .put("status", status)
+
+        if (error != null) {
+            json.put("error", error)
+        }
+
+        val sent = socket.send(json.toString())
+        Log.d(TAG, "remote-command-ack enviado=$sent commandId=$commandId command=$command status=$status error=$error")
     }
 
     private fun sendHello(socket: WebSocket) {
@@ -187,11 +295,3 @@ class RemoteConnectionService : Service() {
         }
     }
 }
-
-
-
-
-
-
-
-

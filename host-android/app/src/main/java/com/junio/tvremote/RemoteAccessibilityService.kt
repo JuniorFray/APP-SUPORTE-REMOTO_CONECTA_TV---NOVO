@@ -35,7 +35,12 @@ class RemoteAccessibilityService : AccessibilityService() {
         Log.d(TAG, "Accessibility Service destruída")
     }
 
-    fun performTap(x: Float, y: Float, duration: Long = 100) {
+    fun performTap(
+        x: Float,
+        y: Float,
+        duration: Long = 100,
+        onResult: ((Boolean) -> Unit)? = null
+    ) {
         val path = Path().apply {
             moveTo(x, y)
         }
@@ -50,17 +55,65 @@ class RemoteAccessibilityService : AccessibilityService() {
                 override fun onCompleted(gestureDescription: GestureDescription?) {
                     super.onCompleted(gestureDescription)
                     Log.d(TAG, "Tap executado com sucesso em ($x, $y)")
+                    onResult?.invoke(true)
                 }
 
                 override fun onCancelled(gestureDescription: GestureDescription?) {
                     super.onCancelled(gestureDescription)
                     Log.e(TAG, "Tap cancelado em ($x, $y)")
+                    onResult?.invoke(false)
                 }
             },
             null
         )
 
-        Log.d(TAG, "dispatchGesture enviado=$dispatched em ($x, $y)")
+        Log.d(TAG, "dispatchGesture tap enviado=$dispatched em ($x, $y)")
+
+        if (!dispatched) {
+            onResult?.invoke(false)
+        }
+    }
+
+    fun performSwipe(
+        x1: Float,
+        y1: Float,
+        x2: Float,
+        y2: Float,
+        duration: Long = 300,
+        onResult: ((Boolean) -> Unit)? = null
+    ) {
+        val path = Path().apply {
+            moveTo(x1, y1)
+            lineTo(x2, y2)
+        }
+
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, duration))
+            .build()
+
+        val dispatched = dispatchGesture(
+            gesture,
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    super.onCompleted(gestureDescription)
+                    Log.d(TAG, "Swipe executado com sucesso de ($x1, $y1) para ($x2, $y2)")
+                    onResult?.invoke(true)
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    super.onCancelled(gestureDescription)
+                    Log.e(TAG, "Swipe cancelado de ($x1, $y1) para ($x2, $y2)")
+                    onResult?.invoke(false)
+                }
+            },
+            null
+        )
+
+        Log.d(TAG, "dispatchGesture swipe enviado=$dispatched de ($x1, $y1) para ($x2, $y2)")
+
+        if (!dispatched) {
+            onResult?.invoke(false)
+        }
     }
 
     fun performGlobalBack(): Boolean {

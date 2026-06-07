@@ -150,7 +150,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    if (["offer", "answer", "candidate"].includes(type)) {
+    if (["offer", "answer", "candidate", "remote-command"].includes(type)) {
       if (!ws.peerInfo) {
         safeSend(ws, { type: "error", message: "hello-required" });
         return;
