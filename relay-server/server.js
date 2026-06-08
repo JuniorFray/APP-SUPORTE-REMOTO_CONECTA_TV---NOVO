@@ -7,7 +7,7 @@ const VALID_TOKEN = "b2136c040c88c7237ec6450c97cfad9b4307cb9bcc2e0192c61be61d004
 const peersByDeviceId = new Map();
 
 function safeSend(ws, payload) {
-  if (ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload));
   }
 }
@@ -63,6 +63,18 @@ function getOtherPeer(ws) {
   return null;
 }
 
+const FORWARDED_TYPES = new Set([
+  "offer",
+  "answer",
+  "candidate",
+  "remote-command",
+  "remote-command-ack",
+  "start-stream",
+  "stop-stream",
+  "frame",
+  "frame-ack"
+]);
+
 const wss = new WebSocket.Server({ host: HOST, port: PORT });
 
 wss.on("listening", () => {
@@ -75,7 +87,7 @@ wss.on("connection", (ws, req) => {
 
   ws.on("message", (msg) => {
     const raw = msg.toString();
-    console.log("message:", raw);
+    console.log("message:", raw.length > 500 ? `${raw.slice(0, 500)}...[truncated]` : raw);
 
     let json;
     try {
@@ -150,7 +162,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    if (["offer", "answer", "candidate", "remote-command"].includes(type)) {
+    if (FORWARDED_TYPES.has(type)) {
       if (!ws.peerInfo) {
         safeSend(ws, { type: "error", message: "hello-required" });
         return;

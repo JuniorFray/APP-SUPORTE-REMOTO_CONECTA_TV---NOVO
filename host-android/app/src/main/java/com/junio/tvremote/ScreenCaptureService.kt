@@ -147,7 +147,6 @@ class ScreenCaptureService : Service() {
             Log.d(TAG, "ImageReader criado")
 
             imageReader?.setOnImageAvailableListener({ reader ->
-                Log.d(TAG, "onImageAvailable")
                 processLatestImage(reader)
             }, captureHandler)
 
@@ -175,7 +174,6 @@ class ScreenCaptureService : Service() {
             image = reader.acquireLatestImage()
 
             if (image == null) {
-                Log.d(TAG, "acquireLatestImage retornou null")
                 return
             }
 

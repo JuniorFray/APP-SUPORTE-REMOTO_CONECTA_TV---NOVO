@@ -5,10 +5,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.graphics.Bitmap
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.util.Base64
 import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,13 +18,30 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
+import kotlin.math.roundToInt
 
 class RemoteConnectionService : Service() {
 
     private var workerThread: HandlerThread? = null
     private var workerHandler: Handler? = null
     private var webSocket: WebSocket? = null
+    private var streamingActive = false
+    private var nextFrameId = 1L
+    private var lastSentSignature: Long = 0L
+    private var framesSent = 0
+    private var framesSkippedSame = 0
+    private var framesSkippedQueue = 0
+
+    private val streamRunnable = object : Runnable {
+        override fun run() {
+            trySendFrame()
+            if (streamingActive) {
+                workerHandler?.postDelayed(this, RemoteConfig.SEND_INTERVAL_MS)
+            }
+        }
+    }
 
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -71,6 +90,7 @@ class RemoteConnectionService : Service() {
 
     override fun onDestroy() {
         Log.d(TAG, "onDestroy")
+        stopStreaming()
         webSocket?.close(1000, "service destroyed")
         webSocket = null
         workerThread?.quitSafely()
@@ -88,7 +108,6 @@ class RemoteConnectionService : Service() {
         }
 
         val service = this
-
         val request = Request.Builder()
             .url(RemoteConfig.WS_URL)
             .build()
@@ -102,20 +121,31 @@ class RemoteConnectionService : Service() {
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                Log.d(TAG, "Mensagem recebida: $text")
+                Log.d(TAG, "Mensagem recebida: ${if (text.length > 300) text.take(300) + "...[truncated]" else text}")
                 try {
                     val json = JSONObject(text)
                     val type = json.optString("type")
 
-                    if (type == "remote-command") {
-                        handleRemoteCommand(webSocket, json)
-                        return
-                    }
-
-                    if (type == "ack" && pendingPair) {
-                        Log.d(TAG, "ack recebido com pendingPair=true; enviando pair")
-                        pendingPair = false
-                        startRemoteSession()
+                    when (type) {
+                        "remote-command" -> {
+                            handleRemoteCommand(webSocket, json)
+                            return
+                        }
+                        "start-stream" -> {
+                            startStreaming()
+                            return
+                        }
+                        "stop-stream" -> {
+                            stopStreaming()
+                            return
+                        }
+                        "ack" -> {
+                            if (pendingPair) {
+                                Log.d(TAG, "ack recebido com pendingPair=true; enviando pair")
+                                pendingPair = false
+                                startRemoteSession()
+                            }
+                        }
                     }
                 } catch (t: Throwable) {
                     Log.e(TAG, "Erro processando mensagem", t)
@@ -129,14 +159,154 @@ class RemoteConnectionService : Service() {
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "WebSocket fechado code=$code reason=$reason")
+                stopStreaming()
                 service.webSocket = null
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.e(TAG, "Falha no WebSocket", t)
+                stopStreaming()
                 service.webSocket = null
             }
         })
+    }
+
+    private fun startStreaming() {
+        if (streamingActive) {
+            Log.d(TAG, "Streaming já ativo")
+            return
+        }
+        streamingActive = true
+        lastSentSignature = 0L
+        framesSent = 0
+        framesSkippedSame = 0
+        framesSkippedQueue = 0
+        Log.d(TAG, "Streaming iniciado")
+        workerHandler?.removeCallbacks(streamRunnable)
+        workerHandler?.post(streamRunnable)
+    }
+
+    private fun stopStreaming() {
+        if (!streamingActive) return
+        streamingActive = false
+        workerHandler?.removeCallbacks(streamRunnable)
+        Log.d(
+            TAG,
+            "Streaming parado sent=$framesSent skippedSame=$framesSkippedSame skippedQueue=$framesSkippedQueue"
+        )
+    }
+
+    private fun trySendFrame() {
+        val socket = webSocket ?: run {
+            Log.d(TAG, "Sem websocket para envio de frame")
+            return
+        }
+
+        val queuedBytes = socket.queueSize()
+        if (queuedBytes > RemoteConfig.MAX_WS_QUEUE_BYTES) {
+            framesSkippedQueue += 1
+            Log.d(TAG, "Pulando frame por fila cheia queueBytes=$queuedBytes")
+            return
+        }
+
+        val bitmap = ScreenCaptureStore.getLatestBitmapCopy() ?: run {
+            Log.d(TAG, "Sem bitmap disponível para envio")
+            return
+        }
+
+        try {
+            val resized = resizeBitmapIfNeeded(bitmap, RemoteConfig.STREAM_MAX_DIMENSION)
+            if (resized !== bitmap) {
+                bitmap.recycle()
+            }
+
+            val signature = calculateSignature(resized)
+            if (signature == lastSentSignature) {
+                framesSkippedSame += 1
+                resized.recycle()
+                return
+            }
+
+            val output = ByteArrayOutputStream()
+            val compressed = resized.compress(
+                Bitmap.CompressFormat.JPEG,
+                RemoteConfig.STREAM_JPEG_QUALITY,
+                output
+            )
+
+            if (!compressed) {
+                Log.e(TAG, "Falha ao comprimir bitmap em JPEG")
+                resized.recycle()
+                return
+            }
+
+            val bytes = output.toByteArray()
+            output.close()
+
+            val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+            val frameId = "frame-${nextFrameId++}"
+
+            val json = JSONObject()
+                .put("type", "frame")
+                .put("deviceId", RemoteConfig.DEVICE_ID)
+                .put("token", RemoteConfig.AUTH_TOKEN)
+                .put("frameId", frameId)
+                .put("width", resized.width)
+                .put("height", resized.height)
+                .put("format", "jpeg")
+                .put("quality", RemoteConfig.STREAM_JPEG_QUALITY)
+                .put("ts", System.currentTimeMillis())
+                .put("imageBase64", base64)
+
+            val sent = socket.send(json.toString())
+            if (sent) {
+                lastSentSignature = signature
+                framesSent += 1
+            }
+
+            Log.d(
+                TAG,
+                "frame enviado=$sent frameId=$frameId bytes=${bytes.size} width=${resized.width} height=${resized.height} queueBytesAfter=${socket.queueSize()}"
+            )
+
+            resized.recycle()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Erro enviando frame", t)
+        }
+    }
+
+    private fun resizeBitmapIfNeeded(source: Bitmap, maxDimension: Int): Bitmap {
+        val width = source.width
+        val height = source.height
+        val largest = maxOf(width, height)
+
+        if (largest <= maxDimension) {
+            return source
+        }
+
+        val scale = maxDimension.toFloat() / largest.toFloat()
+        val targetWidth = (width * scale).roundToInt().coerceAtLeast(1)
+        val targetHeight = (height * scale).roundToInt().coerceAtLeast(1)
+
+        Log.d(TAG, "Redimensionando frame de ${width}x${height} para ${targetWidth}x${targetHeight}")
+        return Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
+    }
+
+    private fun calculateSignature(bitmap: Bitmap): Long {
+        val sampleCols = 8
+        val sampleRows = 8
+        var hash = 1125899906842597L
+
+        for (row in 0 until sampleRows) {
+            val y = if (sampleRows == 1) 0 else ((bitmap.height - 1) * row / (sampleRows - 1))
+            for (col in 0 until sampleCols) {
+                val x = if (sampleCols == 1) 0 else ((bitmap.width - 1) * col / (sampleCols - 1))
+                val pixel = bitmap.getPixel(x, y)
+                hash = 31L * hash + pixel.toLong()
+            }
+        }
+
+        return hash
     }
 
     private fun handleRemoteCommand(socket: WebSocket, json: JSONObject) {
@@ -177,12 +347,7 @@ class RemoteConnectionService : Service() {
                 if (x >= 0f && y >= 0f) {
                     Log.d(TAG, "command=tap x=$x y=$y duration=$duration")
                     accessibility.performTap(x, y, duration) { success ->
-                        sendCommandAck(
-                            socket,
-                            commandId,
-                            command,
-                            if (success) "ok" else "error"
-                        )
+                        sendCommandAck(socket, commandId, command, if (success) "ok" else "error")
                     }
                 } else {
                     Log.e(TAG, "tap inválido x=$x y=$y")
@@ -200,12 +365,7 @@ class RemoteConnectionService : Service() {
                 if (x1 >= 0f && y1 >= 0f && x2 >= 0f && y2 >= 0f) {
                     Log.d(TAG, "command=swipe x1=$x1 y1=$y1 x2=$x2 y2=$y2 duration=$duration")
                     accessibility.performSwipe(x1, y1, x2, y2, duration) { success ->
-                        sendCommandAck(
-                            socket,
-                            commandId,
-                            command,
-                            if (success) "ok" else "error"
-                        )
+                        sendCommandAck(socket, commandId, command, if (success) "ok" else "error")
                     }
                 } else {
                     Log.e(TAG, "swipe inválido x1=$x1 y1=$y1 x2=$x2 y2=$y2")
@@ -232,6 +392,8 @@ class RemoteConnectionService : Service() {
             .put("commandId", commandId)
             .put("command", command)
             .put("status", status)
+            .put("deviceId", RemoteConfig.DEVICE_ID)
+            .put("token", RemoteConfig.AUTH_TOKEN)
 
         if (error != null) {
             json.put("error", error)
